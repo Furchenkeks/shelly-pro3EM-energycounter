@@ -1,181 +1,205 @@
-let energyReturnedWs = 0.0;
-let energyConsumedWs = 0.0;
+// Energiezähler-Daten
+var energyReturnedWs = 0.0;
+var energyConsumedWs = 0.0;
+var energySelfConsumedWs = 0.0;
+var energyWastedWs = 0.0;
 
-let energyReturnedKWh = 0.0;
-let energyConsumedKWh = 0.0;
+var energyReturnedKWh = 0.0;
+var energyConsumedKWh = 0.0;
+var energySelfConsumedKWh = 0.0;
+var energyWastedKWh = 0.0;
 
-let log = 0;
+// OpenDTU-Konfiguration
+var OPENDTU_API_URL = "http://192.168.1.100/api/livedata/status"; // IP ADRESSE anpassen
+var solarPower = 0.0;
+var lastSolarUpdate = 0;
 
-// set this to false to stop publishing on MQTT
-let MQTTpublish = true;
+// Einstellungen
+var log = 1;
+var MQTTpublish = true;
+var updateName = true;
 
-// set this to false if you DONT want to update the name
-// (the updated name is necessary to read the data with the iobroker shelly plugin)
-let updateName = false;
-
-// query the MQTT prefix on startup
-let SHELLY_ID = undefined;
-Shelly.call("Mqtt.GetConfig", "", function (res, err_code, err_msg, ud) {
-  SHELLY_ID = res["topic_prefix"];
+// MQTT-Konfiguration
+var SHELLY_ID = undefined;
+Shelly.call("Mqtt.GetConfig", "", function(res) {
+  if (res && res.topic_prefix) SHELLY_ID = res.topic_prefix;
 });
 
-function SetKVS(key, value)
-{
- Shelly.call(
-   "KVS.Set", {
-     "key": key,
-     "value": value,
-   },
-   function(result) {
-     if (log > 0)
-       print("KVS Saved, rev:", result.rev);
-   }
- );
+// ### Kompatible KVS-Warteschlange ###
+var kvsQueue = [];
+var isProcessingKVS = false;
+
+function processKVSQueue() {
+  if (isProcessingKVS || kvsQueue.length === 0) return;
+  
+  isProcessingKVS = true;
+  var nextItem = kvsQueue[0]; // Manuelles "shift" ersetzen
+  kvsQueue = kvsQueue.slice(1); // Entfernt erstes Element
+  
+  Shelly.call("KVS.Set", {key: nextItem.key, value: nextItem.value}, function() {
+    isProcessingKVS = false;
+    if (nextItem.callback) nextItem.callback();
+    processKVSQueue();
+  });
 }
- 
-function SaveCounters()
-{
-  SetKVS("EnergyConsumedKWh", energyConsumedKWh );
-  SetKVS("EnergyReturnedKWh", energyReturnedKWh );
+
+function SafeKVS_Set(key, value, callback) {
+  kvsQueue[kvsQueue.length] = {key: key, value: value, callback: callback}; // push() Ersatz
+  processKVSQueue();
 }
-     
-Shelly.call(
-   "KVS.Get", {
-     "key": "EnergyReturnedKWh",
-   },
-  function callback(result, error_code, error_message, userdata) {
-     if (error_code === 0) 
-     {
-       energyReturnedKWh = Number(result.value);
-       print("Loaded returned energy: ", energyReturnedKWh, " KWh");
-     }       
-   }
- );
- 
- Shelly.call(
-   "KVS.Get", {
-     "key": "EnergyConsumedKWh",
-   },
-  function callback(result, error_code, error_message, userdata) {
-     if (error_code === 0) 
-     {
-       energyConsumedKWh = Number(result.value);
-       print("Loaded consumed energy: ", energyConsumedKWh, " KWh");
-     }       
-   }
- );
 
-let counter3600 = 0;
-let counter20 = 18;
-
-let lastPublishedMQTTConsumed = "";
-let lastPublishedMQTTReturned = "";
-
-function timerHandler(user_data)
-{
-  let em = Shelly.getComponentStatus("em", 0);
-  if (typeof em.total_act_power !== 'undefined') {
-    let power = em.total_act_power;
-    
-    if (power >= 0)
-    {
-        energyConsumedWs = energyConsumedWs + power * 0.5;
-    }
-    else
-    {
-        energyReturnedWs = energyReturnedWs - power * 0.5;
-    }
-    
-    // once a full Wh is accumulated, move it to the KWh counter
-    let fullWh = Math.floor((energyConsumedWs / 3600));
-    if (fullWh > 0)
-    {
-      energyConsumedKWh += fullWh / 1000;
-      energyConsumedWs -= fullWh * 3600;
-      if (log > 0)
-        print("Changed consumed KWh: ",energyConsumedKWh);
-    }
-    
-    fullWh = Math.floor((energyReturnedWs / 3600));
-    if (fullWh > 0)
-    {
-      energyReturnedKWh += fullWh / 1000;
-      energyReturnedWs -= fullWh * 3600;
-      if (log > 0)
-        print("Changed returned KWh: ",energyReturnedKWh);
-    }
-    
-    if (log > 0)
-      print(power , "W");
-      
-    counter3600 = counter3600 + 1;
-    if (counter3600 > 3600)      
-    {
-      counter3600 = 0;     
-      SaveCounters();
-    }
-    
-    counter20 = counter20 + 1;
-    if ( counter20 > 20)
-    {
-      counter20 = 0;  
-      if (updateName)
-      {
-        Shelly.call(
-          "Sys.SetConfig", {
-             config: {device:{name:energyConsumedKWh.toFixed(3)+" KWh ; "+(energyReturnedKWh+energyReturnedWs / 3600000).toFixed(5)+" KWh"}},
-          },
-          function(result, error_code, error_message, userdata) {
-             //print("error ", error_code, " : ", error_message);
-             //print("result", JSON.stringify(result));
+// ### Initiale Ladung der KVS-Werte ###
+function loadKVS() {
+  var keys = ["EnergyConsumedKWh", "EnergyReturnedKWh", "EnergySelfConsumedKWh", "EnergyWastedKWh"];
+  var loadedCount = 0;
+  
+  for (var i = 0; i < keys.length; i++) {
+    Shelly.call("KVS.Get", {key: keys[i]}, (function(key) {
+      return function(res) {
+        if (res && res.value !== undefined && res.value !== null) {
+          var value = parseFloat(res.value);
+          if (!isNaN(value)) {
+            switch(key) {
+              case "EnergyConsumedKWh": energyConsumedKWh = value; break;
+              case "EnergyReturnedKWh": energyReturnedKWh = value; break;
+              case "EnergySelfConsumedKWh": energySelfConsumedKWh = value; break;
+              case "EnergyWastedKWh": energyWastedKWh = value; break;
+            }
+            if (log) print("Geladen", key + ":", value);
           }
-        );
-      }
-             
-      if (typeof SHELLY_ID !== "undefined" && MQTTpublish === true) 
-      {         
-        let value = energyConsumedKWh.toFixed(3);
-        if (value !== lastPublishedMQTTConsumed)
-        {
-          MQTT.publish(
-            SHELLY_ID + "/energy_counter/consumed",
-            value,
-            0,
-            false
-          );
-          lastPublishedMQTTConsumed = value;
         }
-        
-        let value = energyReturnedKWh.toFixed(3);
-        if (value !== lastPublishedMQTTReturned)
-        {
-          MQTT.publish(
-            SHELLY_ID + "/energy_counter/returned",
-            value,
-            0,
-            false
-          );
-          lastPublishedMQTTReturned = value;
-        }           
-      }
+        loadedCount++;
+        if (loadedCount === keys.length) initComplete();
+      };
+    })(keys[i]));
+  }
+}
+
+function initComplete() {
+  Timer.set(10000, true, fetchSolarPower, null);  // Aktuallisierung der Daten von OPENDTU
+  if (log) print("Initialisierung abgeschlossen");
+}
+
+// ### OpenDTU-Abfrage ###
+function fetchSolarPower() {
+  Shelly.call("HTTP.GET", {
+    url: OPENDTU_API_URL,
+    timeout: 10
+  }, function(response, error_code, error_message) {
+    if (error_code !== 0 || !response || !response.body) {
+      if (log) print("OpenDTU Fehler:", error_message || "Keine Antwort");
+      solarPower = 0;
+      return;
     }
-  };
+
+    try {
+      var data = JSON.parse(response.body);
+      solarPower = (data.total && data.total.Power && data.total.Power.v) || 0;
+      lastSolarUpdate = Date.now();
+      if (log) print("SolarPower:", solarPower + "W");
+    } catch(e) {
+      if (log) print("OpenDTU Parse-Fehler:", e);
+      solarPower = 0;
+    }
+  });
 }
 
-Timer.set(500, true, timerHandler, null);
+// ### Haupt-Timer ###
+var lastMQTTPublish = 0;
+Timer.set(500, true, function() {
+  var em = Shelly.getComponentStatus("em", 0);
+  if (!em || typeof em.total_act_power === "undefined") return;
 
-function httpServerHandler(request, response) {
-    response.code = 200;
+  var gridPower = em.total_act_power;
+  
+  // Energiefluss-Berechnung
+  if (gridPower < 0) {
+    energyReturnedWs += -gridPower * 0.5;
+  } else {
+    if (solarPower > 0) {
+      var selfConsumed = Math.min(solarPower, gridPower);
+      var wasted = Math.max(0, solarPower - gridPower);
+      
+      energySelfConsumedWs += selfConsumed * 0.5;
+      energyWastedWs += wasted * 0.5;
+      energyConsumedWs += Math.max(0, gridPower - selfConsumed) * 0.5;
+    } else {
+      energyConsumedWs += gridPower * 0.5;
+    }
+  }
 
-    // create JSON object 
-    const energyData = {
-        energyConsumed: energyConsumedKWh.toFixed(3) + " KWh",
-        energyReturned: (energyReturnedKWh+(energyReturnedWs / 3600000)).toFixed(5) + " KWh"
-    };
+  // Ws → kWh Umrechnung
+  function convert(ws, kwh) {
+    var wh = Math.floor(ws / 3600);
+    if (wh > 0) {
+      kwh += wh / 1000;
+      ws -= wh * 3600;
+    }
+    return {ws: ws, kwh: kwh};
+  }
+  
+  var consumed = convert(energyConsumedWs, energyConsumedKWh);
+  energyConsumedWs = consumed.ws;
+  energyConsumedKWh = consumed.kwh;
+  
+  var returned = convert(energyReturnedWs, energyReturnedKWh);
+  energyReturnedWs = returned.ws;
+  energyReturnedKWh = returned.kwh;
+  
+  var selfConsumed = convert(energySelfConsumedWs, energySelfConsumedKWh);
+  energySelfConsumedWs = selfConsumed.ws;
+  energySelfConsumedKWh = selfConsumed.kwh;
+  
+  var wasted = convert(energyWastedWs, energyWastedKWh);
+  energyWastedWs = wasted.ws;
+  energyWastedKWh = wasted.kwh;
 
-    // convert JSON object to string and send it as reply
-    response.body = JSON.stringify(energyData);
-    response.send();
-    return;
-}
-HTTPServer.registerEndpoint("energy_counter", httpServerHandler);
+  // Alle 20s aktualisieren
+  if (Date.now() - lastMQTTPublish > 20000) {
+    lastMQTTPublish = Date.now();
+    
+    if (updateName) {
+      Shelly.call("Sys.SetConfig", {
+        config: {
+          device: {
+            name: "Ver: " + energyConsumedKWh.toFixed(3) + "kWh | " +
+                  "Eig: " + energySelfConsumedKWh.toFixed(3) + "kWh | " +
+                  "Rück: " + energyReturnedKWh.toFixed(3) + "kWh | " +
+                  "Verl: " + energyWastedKWh.toFixed(3) + "kWh"
+          }
+        }
+      }, null);
+    }
+    
+    if (MQTTpublish && SHELLY_ID) {
+      MQTT.publish(SHELLY_ID + "/energy/consumed", energyConsumedKWh.toFixed(3), 0, false);
+      MQTT.publish(SHELLY_ID + "/energy/returned", energyReturnedKWh.toFixed(3), 0, false);
+      MQTT.publish(SHELLY_ID + "/energy/self_consumed", energySelfConsumedKWh.toFixed(3), 0, false);
+      MQTT.publish(SHELLY_ID + "/energy/wasted", energyWastedKWh.toFixed(3), 0, false);
+    }
+    
+    // Serialisierte KVS-Speicherung
+    SafeKVS_Set("EnergyConsumedKWh", energyConsumedKWh);
+    SafeKVS_Set("EnergyReturnedKWh", energyReturnedKWh);
+    SafeKVS_Set("EnergySelfConsumedKWh", energySelfConsumedKWh);
+    SafeKVS_Set("EnergyWastedKWh", energyWastedKWh);
+  }
+});
+
+// Initialisierung
+loadKVS();
+
+// HTTP-API
+HTTPServer.registerEndpoint("energy", function(request, response) {
+  response.code = 200;
+  response.body = JSON.stringify({
+    consumed_kWh: energyConsumedKWh.toFixed(3),
+    returned_kWh: energyReturnedKWh.toFixed(3),
+    self_consumed_kWh: energySelfConsumedKWh.toFixed(3),
+    wasted_kWh: energyWastedKWh.toFixed(3),
+    solar_power: solarPower.toFixed(1),
+    last_update: new Date().toISOString(),
+    kvs_queue: kvsQueue.length
+  });
+  response.send();
+});
