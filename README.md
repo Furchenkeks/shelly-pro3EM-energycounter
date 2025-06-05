@@ -1,4 +1,5 @@
-WARNING: this script does not work with firmware 1.0.7 currenty! See Issue #2.
+Dieses Script läuft mit der aktuellen Version 1.6.1 (Juni 2025)
+
 
 # shelly-pro3EM-energycounter
 
