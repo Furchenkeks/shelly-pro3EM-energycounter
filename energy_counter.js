@@ -1,343 +1,441 @@
+// Shelly Energiezähler Skript mit Solar-Eigenverbrauch, "verschwendeter" Einspeisung, täglichem Netzbezug und aktueller Gesamtleistung
+// Version 1.4.2
+// Änderungen gegenüber V1.4.1:
+// - ReferenceError für PUBLISH_MQTT_INTERVAL_CYCLES korrigiert (Definitionsreihenfolge).
+//
+// Basis V1.4.1 Änderungen:
+// - Funktion manualResetDailyCounters() zum manuellen Zurücksetzen der Tageswerte hinzugefügt.
+// - Korrekturen für den automatischen Tagesreset beibehalten.
 
-// Energiezähler-Daten (Gesamtwerte)
-var energyReturnedWs = 0.0;
-var energyConsumedWs = 0.0;
-var energySelfConsumedWs = 0.0;
-var energyWastedWs = 0.0;
+// Zähler für Netzbezug/-einspeisung (Gesamtwerte)
+let energyReturnedWs = 0.0;
+let energyConsumedWs = 0.0; // Gesamt-Netzbezug Ws
+let energyReturnedKWh = 0.0;
+let energyConsumedKWh = 0.0; // Gesamt-Netzbezug kWh
 
-var energyReturnedKWh = 0.0;
-var energyConsumedKWh = 0.0;
-var energySelfConsumedKWh = 0.0;
-var energyWastedKWh = 0.0;
+// Zähler für tägliche Werte
+let dailyGridConsumedKWh = 0.0;       // TÄGLICHER Netzbezug in kWh (für "Tag" im Titel)
+let dailyGridConsumedWs = 0.0;        // Hilfsvariable für täglichen Netzbezug in Ws
+let dailySolarSelfConsumptionKWh = 0.0; // Tägliche Einsparung durch direkten Solarverbrauch ("Spar")
+let dailySolarWastedKWh = 0.0;          // Tägliche "Verschwendung" durch nicht vergütete Solareinspeisung
+let dailySolarSelfConsumptionWs = 0.0;
+let dailySolarWastedWs = 0.0;
 
-// Tageswerte
-var dailyEnergyReturnedKWh = 0.0;
-var dailyEnergyConsumedKWh = 0.0;
-var dailyEnergySelfConsumedKWh = 0.0;
-var dailyEnergyWastedKWh = 0.0;
-var lastDayChecked = -1;
+// Globale Variable für aktuelle Solarleistung (gelesen aus KVS)
+let currentSolarPower = 0.0; // in Watt
 
-// OpenDTU-Konfiguration
-var OPENDTU_API_URL = "http://192.168.0.100/api/livedata/status"; // Ihre OpenDTU API URL
-var OPENDTU_FETCH_INTERVAL_MS = 5000; // Abfrageintervall für OpenDTU in Millisekunden (Standard: 5 Sekunden)
-var solarPower = 0.0;             // Aktuelle Solarleistung in Watt
-var lastSolarUpdate = 0;          // Zeitstempel der letzten Solar-Aktualisierung
+// KVS-Schlüssel und Intervalle
+const KVS_KEY_SOLAR_POWER = "currentSolarPowerWatts";
+const SOLAR_POWER_READ_INTERVAL_MS = 5000;
+const DAILY_STATS_RESET_CHECK_INTERVAL_MS = 60 * 60 * 1000; // Stündliche Prüfung für Tagesreset
+let lastDayCheckedForDailyStats = -1; // Wird initial auf -1 gesetzt, um Ladefehler zu erkennen
 
 // Einstellungen
-var log = 1;
-var MQTTpublish = true;
-var updateName = true;
-var showSolarInConsole = true; // Steuert Konsolenausgabe der Solarleistung (wenn log=1)
+let log = 1; // 0=kein Log, 1=Basis-Log, 2=Detail-Log (Empfehlung: 1 für normalen Betrieb)
+let MQTTpublish = true;
+let updateName = true; // Für Gerätenamen-Update
 
-// MQTT-Konfiguration
-var SHELLY_ID = undefined;
-Shelly.call("Mqtt.GetConfig", "", function(res) {
-  if (res && res.topic_prefix) SHELLY_ID = res.topic_prefix;
-  if (log && SHELLY_ID) print("MQTT Topic Prefix (SHELLY_ID):", SHELLY_ID);
-  else if (log && !SHELLY_ID) print("MQTT Topic Prefix konnte nicht ermittelt werden.");
+let SHELLY_ID = undefined;
+Shelly.call("Mqtt.GetConfig", "", function (res, err_code, err_msg, ud) {
+  if (res && res.topic_prefix) {
+    SHELLY_ID = res.topic_prefix;
+    if (log > 0) print("MQTT Topic Prefix (SHELLY_ID):", SHELLY_ID);
+  } else if (log > 0) {
+    print("MQTT Topic Prefix konnte nicht ermittelt werden. Code:", err_code, "Msg:", err_msg);
+  }
 });
 
 // Konstanten
-var MS_PER_DAY = 24 * 60 * 60 * 1000;
-var WS_PER_WH = 3600;
-var WH_PER_KWH = 1000;
-var WS_TO_KWH_FACTOR = 1 / WS_PER_WH / WH_PER_KWH;
-var TIMER_INTERVAL_SECONDS = 0.5;
-var MQTT_PUBLISH_INTERVAL_MS = 5000;  // MQTT Update alle 5 Sekunden
-var KVS_SAVE_INTERVAL_MS = 20000;     // KVS Speicherung alle 20 Sekunden
+const TIMER_INTERVAL_SECONDS = 1.0; // Haupt-Timer Intervall
 
-// ### Kompatible KVS-Warteschlange (Key-Value Store) ###
-var kvsQueue = [];
-var isProcessingKVS = false;
-
-function processKVSQueue() {
-  if (isProcessingKVS || kvsQueue.length === 0) return;
-  
-  isProcessingKVS = true;
-  var nextItem = kvsQueue[0];
-  kvsQueue = kvsQueue.slice(1);
-  
-  Shelly.call("KVS.Set", {key: nextItem.key, value: nextItem.value}, function(result, error_code, error_message) {
-    isProcessingKVS = false;
-    if (error_code !== 0 && log) {
-        print("KVS.Set Fehler für Key '", nextItem.key, "': ", error_message, " (Code: ", error_code, ")");
-    }
-    if (nextItem.callback) nextItem.callback(result, error_code, error_message);
-    processKVSQueue();
-  });
-}
-
-function SafeKVS_Set(key, value, callback) {
-  kvsQueue.push({key: key, value: value, callback: callback});
-  processKVSQueue();
-}
-
-// ### Datumsformatierung (korrigiert) ###
-function formatDate(dayOffset) {
-  var d = new Date();
-  if (dayOffset) {
-    var currentTimestamp = d.getTime();
-    var offsetMilliseconds = dayOffset * MS_PER_DAY;
-    d = new Date(currentTimestamp + offsetMilliseconds);
+// ### Manuelle Padding-Funktion (Ersatz für padStart) ###
+function manualPadStart(str, targetLength, padString) {
+  str = String(str);
+  padString = String((typeof padString !== 'undefined' ? padString : ' '));
+  if (str.length >= targetLength) {
+    return str;
   }
-  var year = d.getFullYear();
-  var month = String(d.getMonth() + 1).padStart(2, '0');
-  var day = String(d.getDate()).padStart(2, '0');
-  return year + "-" + month + "-" + day;
+  let padding = "";
+  let charsToPad = targetLength - str.length;
+  while (padding.length < charsToPad) {
+    padding += padString;
+  }
+  return padding.slice(0, charsToPad) + str;
 }
+
+// ### KVS-Schreibwarteschlange ###
+let kvsWriteQueue = [];
+let isProcessingKVSWriteQueue = false;
+
+function processKVSWriteQueue() {
+  if (isProcessingKVSWriteQueue || kvsWriteQueue.length === 0) {
+    return;
+  }
+  isProcessingKVSWriteQueue = true;
+  let task = kvsWriteQueue[0];
+
+  Shelly.call(
+    "KVS.Set", { "key": task.key, "value": task.value },
+    function(result, error_code, error_message) {
+      if (error_code === 0) {
+        if (log > 1) print("KVS Saved Key:", task.key, "Value:", task.value, "Rev:", result.rev);
+      } else {
+        if (log > 0) print("KVS.Set Fehler für Key '", task.key, "': ", error_message, " (Code: ", error_code, ")");
+      }
+      kvsWriteQueue = kvsWriteQueue.slice(1);
+      isProcessingKVSWriteQueue = false;
+      processKVSWriteQueue();
+    }
+  );
+}
+
+function SetKVS(key, value) {
+  let existingTaskIndex = -1;
+  for (let i = 0; i < kvsWriteQueue.length; i++) {
+    if (kvsWriteQueue[i].key === key) {
+      existingTaskIndex = i;
+      break;
+    }
+  }
+  if (existingTaskIndex !== -1) {
+    kvsWriteQueue[existingTaskIndex].value = value;
+    if (log > 1) print("KVS Queue: Wert für Key '", key, "' aktualisiert auf '", value, "'");
+  } else {
+    kvsWriteQueue.push({ "key": key, "value": value });
+    if (log > 1) print("KVS Queue: Neuer Key '", key, "' mit Wert '", value, "' hinzugefügt.");
+  }
+  processKVSWriteQueue();
+}
+// Ende KVS-Schreibwarteschlange
 
 // ### Leistungsformatierung (Auto W/kW) ###
 function formatPower(power) {
   if (power === null || typeof power === "undefined") return "N/A";
-  return Math.abs(power) >= 1000 ? (power / 1000).toFixed(1) + "kW" : Math.round(power) + "W";
-}
-
-// ### Tageswechsel-Prüfung ###
-function checkDayChange() {
-  var now = new Date();
-  var currentDay = now.getDate();
-  
-  if (currentDay !== lastDayChecked) {
-    if (lastDayChecked !== -1) {
-      if (log) print("Tageswechsel erkannt - Speichere Vortageswerte und resette Tageswerte.");
-      var yesterdayStr = formatDate(-1);
-      SafeKVS_Set("DailyEnergyConsumedKWh_" + yesterdayStr, dailyEnergyConsumedKWh.toFixed(3));
-      SafeKVS_Set("DailyEnergyReturnedKWh_" + yesterdayStr, dailyEnergyReturnedKWh.toFixed(3));
-      SafeKVS_Set("DailyEnergySelfConsumedKWh_" + yesterdayStr, dailyEnergySelfConsumedKWh.toFixed(3));
-      SafeKVS_Set("DailyEnergyWastedKWh_" + yesterdayStr, dailyEnergyWastedKWh.toFixed(3));
-    }
-    
-    dailyEnergyConsumedKWh = 0;
-    dailyEnergyReturnedKWh = 0;
-    dailyEnergySelfConsumedKWh = 0;
-    dailyEnergyWastedKWh = 0;
-    lastDayChecked = currentDay;
-
-    if (log) print("Tageswerte zurückgesetzt. Neuer Tag:", formatDate(0));
+  if (Math.abs(power) >= 1000) {
+    return (power / 1000).toFixed(1) + "kW";
   }
+  return Math.round(power) + "W";
 }
 
-// ### KVS-Ladung ###
-function loadKVS() {
-  var keysToLoad = [
-    "EnergyConsumedKWh", "EnergyReturnedKWh", "EnergySelfConsumedKWh", "EnergyWastedKWh",
-    "DailyEnergyConsumedKWh", "DailyEnergyReturnedKWh", "DailyEnergySelfConsumedKWh", "DailyEnergyWastedKWh"
-  ];
-  var currentIndex = 0;
+function SaveAllCountersToKVS() { // Speichert Gesamt- und aktuelle Tageswerte
+  SetKVS("EnergyConsumedKWh", energyConsumedKWh.toFixed(5)); // Gesamt Netzbezug
+  SetKVS("EnergyReturnedKWh", energyReturnedKWh.toFixed(5)); // Gesamt Netzeinspeisung
 
-  function loadNextKey() {
-    if (currentIndex >= keysToLoad.length) {
-      if (lastDayChecked === -1) {
-          lastDayChecked = new Date().getDate();
-      }
-      checkDayChange();
+  SetKVS("DailyGridConsumedKWh", dailyGridConsumedKWh.toFixed(5)); // Aktueller Tages-Netzbezug
+  SetKVS("DailySolarSelfConsumptionKWh", dailySolarSelfConsumptionKWh.toFixed(5)); // Aktueller Tages-Solar-Eigenverbrauch
+  SetKVS("DailySolarWastedKWh", dailySolarWastedKWh.toFixed(5)); // Aktuelle Tages-Solar-Verschwendung
 
-      // Timer starten, OpenDTU-Intervall wird hier verwendet
-      Timer.set(OPENDTU_FETCH_INTERVAL_MS, true, fetchSolarPower); 
-      Timer.set(60000, true, checkDayChange);
-      Timer.set(3000, true, updatePowerDisplay);
-      if (log) print("Initialisierung (KVS-Ladung und Timer-Setup) abgeschlossen. OpenDTU-Abfrage alle", OPENDTU_FETCH_INTERVAL_MS / 1000, "s.");
-      return;
-    }
+  SetKVS("lastDayCheckedForDailyStats", String(lastDayCheckedForDailyStats));
+  if (log > 0) print("Alle Zählerstände (Gesamt & aktuelle Tageswerte) zum Speichern in KVS-Queue eingereiht.");
+}
 
-    var key = keysToLoad[currentIndex];
-    Shelly.call("KVS.Get", {key: key}, function(res) {
-      if (res && typeof res.value !== "undefined" && res.value !== null) {
-        var value = parseFloat(res.value);
-        if (!isNaN(value)) {
-          switch(key) {
-            case "EnergyConsumedKWh": energyConsumedKWh = value; break;
-            case "EnergyReturnedKWh": energyReturnedKWh = value; break;
-            case "EnergySelfConsumedKWh": energySelfConsumedKWh = value; break;
-            case "EnergyWastedKWh": energyWastedKWh = value; break;
-            case "DailyEnergyConsumedKWh": dailyEnergyConsumedKWh = value; break;
-            case "DailyEnergyReturnedKWh": dailyEnergyReturnedKWh = value; break;
-            case "DailyEnergySelfConsumedKWh": dailyEnergySelfConsumedKWh = value; break;
-            case "DailyEnergyWastedKWh": dailyEnergyWastedKWh = value; break;
-          }
-          if (log) print("Aus KVS geladen:", key + ":", value.toFixed(3));
-        } else if (log) {
-            print("KVS-Wert für '", key, "' ist keine gültige Zahl:", res.value);
+// ### Laden der KVS-Werte beim Start ###
+let kvsValuesToLoad = [
+    { key: "EnergyReturnedKWh", callback: function(value) { energyReturnedKWh = value; if (log > 0) print("Geladen Netzeinspeisung (gesamt):", value, "kWh"); } },
+    { key: "EnergyConsumedKWh", callback: function(value) { energyConsumedKWh = value; if (log > 0) print("Geladen Netzbezug (gesamt):", value, "kWh"); } },
+
+    { key: "DailyGridConsumedKWh", callback: function(value) { dailyGridConsumedKWh = value; if (log > 0) print("Geladen tägl. Netzbezug:", value, "kWh"); } },
+    { key: "DailySolarSelfConsumptionKWh", callback: function(value) { dailySolarSelfConsumptionKWh = value; if (log > 0) print("Geladen tägl. Solar-Eigenverbrauch:", value, "kWh"); } },
+    { key: "DailySolarWastedKWh", callback: function(value) { dailySolarWastedKWh = value; if (log > 0) print("Geladen tägl. Solar-Verschwendung:", value, "kWh"); } },
+
+    { key: "lastDayCheckedForDailyStats", callback: function(value) {
+        let parsedValue = parseInt(value); 
+        if (!isNaN(parsedValue)) {
+            lastDayCheckedForDailyStats = parsedValue;
+            if (log > 0) print("Geladen lastDayCheckedForDailyStats:", parsedValue);
+        } else {
+            lastDayCheckedForDailyStats = -1; 
+            if (log > 0) print("Ungültiger Wert für lastDayCheckedForDailyStats aus KVS ('", value, "'). Setze auf -1.");
         }
-      }
-      currentIndex++;
-      loadNextKey();
+    } }
+];
+
+function loadKVSSequentially(index) {
+    if (index >= kvsValuesToLoad.length) {
+        checkAndResetDailyStats(); 
+        return;
+    }
+    let item = kvsValuesToLoad[index];
+    Shelly.call("KVS.Get", { "key": item.key },
+        function(result, error_code, error_message) {
+            if (error_code === 0 && result && result.value !== null) {
+                if (item.key !== "lastDayCheckedForDailyStats") {
+                    let numValue = Number(result.value);
+                    if (!isNaN(numValue)) {
+                        item.callback(numValue);
+                    } else if (log > 0) {
+                        print("KVS-Wert für '", item.key, "' ist keine gültige Zahl:", result.value);
+                    }
+                } else {
+                     item.callback(result.value); 
+                }
+            } else { 
+                 if (log > 0 && error_code !== 0) {
+                     print("KVS.Get Fehler für Key '", item.key, "':", error_message, "(Code:", error_code, ")");
+                 } else if (log > 0 && result && result.value === null) { 
+                     print("KVS Key '", item.key, "' nicht gefunden oder Wert ist null.");
+                 }
+                 if (item.key === "lastDayCheckedForDailyStats") {
+                     item.callback(null); 
+                 }
+            }
+            loadKVSSequentially(index + 1);
+        }
+    );
+}
+if (log > 0) print("Starte KVS Ladevorgang...");
+loadKVSSequentially(0);
+
+
+// ### Solarleistung aus KVS lesen ###
+function readSolarPowerFromKVS() {
+    Shelly.call("KVS.Get", { key: KVS_KEY_SOLAR_POWER }, function(result, error_code, error_message) {
+        if (error_code === 0 && result && typeof result.value !== "undefined" && result.value !== null) {
+            let kvsSolarVal = parseFloat(result.value);
+            if (!isNaN(kvsSolarVal)) {
+                currentSolarPower = kvsSolarVal;
+            } else {
+                if (log > 0) print("Ungültiger Solarwert aus KVS [", KVS_KEY_SOLAR_POWER, "]:", result.value, ". Setze auf 0.");
+                currentSolarPower = 0;
+            }
+        } else {
+            if (log > 0) print("Fehler/kein Wert beim Lesen von Solarleistung aus KVS [", KVS_KEY_SOLAR_POWER, "]. Setze auf 0.");
+            currentSolarPower = 0;
+        }
     });
-  }
-
-  if (log) print("Starte KVS-Ladevorgang...");
-  loadNextKey();
 }
+Timer.set(SOLAR_POWER_READ_INTERVAL_MS, true, readSolarPowerFromKVS);
+readSolarPowerFromKVS(); 
 
-// ### OpenDTU-Abfrage ###
-function fetchSolarPower() {
-  if (!OPENDTU_API_URL) {
-    if (log && solarPower !== 0) print("OpenDTU API URL nicht konfiguriert. Solarleistung wird auf 0 gesetzt.");
-    solarPower = 0;
-    return;
-  }
-  Shelly.call("HTTP.GET", {
-    url: OPENDTU_API_URL,
-    timeout: Math.max(5, Math.floor(OPENDTU_FETCH_INTERVAL_MS / 1000) -1) // Timeout etwas kürzer als das Intervall, aber mind. 5s
-  }, function(response, error_code, error_message, userdata) {
-    if (error_code !== 0 || !response || !response.body) {
-      if (log) print("OpenDTU Fehler:", error_message || "Keine Antwort oder leerer Body. Code:", error_code);
-      solarPower = 0;
-      return;
+// ### Täglichen Reset der Zähler prüfen und durchführen (korrigierte Version) ###
+function checkAndResetDailyStats() {
+    let now = new Date();
+    let currentDay = now.getDate();
+    let performReset = false;
+
+    if (lastDayCheckedForDailyStats === -1 || isNaN(lastDayCheckedForDailyStats)) {
+        if (log > 0) print("checkAndResetDailyStats: lastDayCheckedForDailyStats ist ungültig/nicht initialisiert (" + lastDayCheckedForDailyStats + "). Tageszähler werden zurückgesetzt.");
+        performReset = true;
+    } else if (currentDay !== lastDayCheckedForDailyStats) {
+        if (log > 0) print("checkAndResetDailyStats: Tageswechsel erkannt (aktuell: " + currentDay + ", gespeichert: " + lastDayCheckedForDailyStats + "). Reset und Speicherung der Vortageswerte.");
+        performReset = true;
     }
 
-    try {
-      var data = JSON.parse(response.body);
-      if (data && data.total && data.total.Power && typeof data.total.Power.v !== "undefined") {
-        solarPower = parseFloat(data.total.Power.v) || 0;
-      } else {
-        if (log) print("OpenDTU Parse-Warnung: Pfad 'total.Power.v' nicht in JSON-Antwort gefunden. Solarleistung auf 0 gesetzt.");
-        solarPower = 0;
-      }
-      lastSolarUpdate = Date.now();
-      if (showSolarInConsole && log) print("Solarleistung aktuell:", formatPower(solarPower));
-    } catch(e) {
-      if (log) print("OpenDTU Parse-Fehler:", e.toString());
-      solarPower = 0;
-    }
-  });
-}
+    if (performReset) {
+        if (lastDayCheckedForDailyStats !== -1 && !isNaN(lastDayCheckedForDailyStats) && currentDay !== lastDayCheckedForDailyStats) {
+            let yesterdayDateObj = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+            let year = yesterdayDateObj.getFullYear();
+            let month = manualPadStart(String(yesterdayDateObj.getMonth() + 1), 2, '0');
+            let day = manualPadStart(String(yesterdayDateObj.getDate()), 2, '0');
+            let yesterdayStr = year + "-" + month + "-" + day;
 
-// ### Funktion: Echtzeit-Anzeige-Update des Gerätenamens ###
-function updatePowerDisplay() {
-  if (!updateName) return;
+            SetKVS("GridConsumed_" + yesterdayStr + "_KWh", dailyGridConsumedKWh.toFixed(5));
+            SetKVS("SolarSelfConsumption_" + yesterdayStr + "_KWh", dailySolarSelfConsumptionKWh.toFixed(5));
+            SetKVS("SolarWasted_" + yesterdayStr + "_KWh", dailySolarWastedKWh.toFixed(5));
+            if (log > 0) print("Vortageswerte für", yesterdayStr, "(basierend auf gestern vor 'now') zum Speichern in KVS-Queue eingereiht.");
+        }
 
-  var emStatus = Shelly.getComponentStatus("em", 0);
-  if (!emStatus) {
-    if (log) print("Fehler beim Abrufen von emStatus für updatePowerDisplay.");
-    return;
-  }
+        dailyGridConsumedKWh = 0.0;
+        dailyGridConsumedWs = 0.0;
+        dailySolarSelfConsumptionKWh = 0.0;
+        dailySolarWastedKWh = 0.0;
+        dailySolarSelfConsumptionWs = 0.0;
+        dailySolarWastedWs = 0.0;
 
-  var phase1_W = emStatus.a_act_power || 0;
-  var phase2_W = emStatus.b_act_power || 0;
-  var phase3_W = emStatus.c_act_power || 0;
-  var totalDisplayedPower_W = phase1_W + phase2_W + phase3_W;
-  
-  var dailySavingsKWh = dailyEnergySelfConsumedKWh + dailyEnergyReturnedKWh;
-  
-  var deviceName = "Aktuell: " + formatPower(totalDisplayedPower_W) + " | " +
-                   "Solar: " + formatPower(solarPower) + " | " +
-                   "Heute: " + dailyEnergyConsumedKWh.toFixed(2) + "kWh | " +
-                   "Ersparnis: " + dailySavingsKWh.toFixed(2) + "kWh";
+        lastDayCheckedForDailyStats = currentDay; 
+        SetKVS("lastDayCheckedForDailyStats", String(lastDayCheckedForDailyStats)); 
 
-  Shelly.call("Sys.SetConfig", {
-    config: {
-      device: { name: deviceName }
-    }
-  }, function(result, error_code, error_message){
-      if (error_code !== 0 && log) {
-          print("Fehler beim Setzen des Gerätenamens:", error_message);
-      }
-  });
-}
-
-// ### Ws -> kWh Umrechnung mit Restwerterhaltung ###
-function convertWsToKWhWithRemainder(currentWs, currentKWh) {
-  var accumulatedWh = Math.floor(currentWs / WS_PER_WH);
-  if (accumulatedWh !== 0) {
-    currentKWh += accumulatedWh / WH_PER_KWH;
-    currentWs -= accumulatedWh * WS_PER_WH;
-  }
-  return { ws: currentWs, kwh: currentKWh };
-}
-
-// ### Haupt-Timer (Energieberechnung) ###
-var lastMQTTPublishTime = 0;
-var lastKVSSaveTime = 0; // Zeitstempel der letzten KVS Speicherung
-
-Timer.set(TIMER_INTERVAL_SECONDS * 1000, true, function() {
-  var emStatus = Shelly.getComponentStatus("em", 0);
-  if (!emStatus || typeof emStatus.total_act_power === "undefined") {
-    if (log) print("Haupttimer: emStatus oder total_act_power nicht verfügbar.");
-    return;
-  }
-
-  var gridPower_W = emStatus.total_act_power;
-  var currentSolarPower_W = solarPower;
-
-  var returnedEnergyInc_Ws = 0;
-  var consumedEnergyInc_Ws = 0;
-  var selfConsumedEnergyInc_Ws = 0;
-  var wastedEnergyInc_Ws = 0;
-
-  if (gridPower_W < 0) {
-    returnedEnergyInc_Ws = -gridPower_W * TIMER_INTERVAL_SECONDS;
-  } else {
-    if (currentSolarPower_W > 0) {
-      consumedEnergyInc_Ws = Math.max(0, gridPower_W - currentSolarPower_W) * TIMER_INTERVAL_SECONDS;
-      selfConsumedEnergyInc_Ws = Math.min(currentSolarPower_W, gridPower_W) * TIMER_INTERVAL_SECONDS;
-      wastedEnergyInc_Ws = Math.max(0, currentSolarPower_W - gridPower_W) * TIMER_INTERVAL_SECONDS;
+        if (log > 0) print("Alle täglichen Zähler zurückgesetzt. Neuer Tag:", currentDay);
     } else {
-      consumedEnergyInc_Ws = gridPower_W * TIMER_INTERVAL_SECONDS;
+        if (log > 0) print("Kein Tagesreset erforderlich. Aktueller Tag:", currentDay, ", Letzter geprüfter Tag:", lastDayCheckedForDailyStats);
+    }
+}
+Timer.set(DAILY_STATS_RESET_CHECK_INTERVAL_MS, true, checkAndResetDailyStats); 
+
+// ### NEUE FUNKTION: Manueller Reset der Tageszähler ###
+function manualResetDailyCounters() {
+  if (log > 0) print("MANUELLER RESET DER TAGESZÄHLER GESTARTET.");
+
+  dailyGridConsumedKWh = 0.0;
+  dailyGridConsumedWs = 0.0;
+  dailySolarSelfConsumptionKWh = 0.0;
+  dailySolarWastedKWh = 0.0;
+  dailySolarSelfConsumptionWs = 0.0;
+  dailySolarWastedWs = 0.0;
+
+  if (log > 0) print("Manuell: Tageszähler (kWh und Ws) wurden auf 0.0 gesetzt.");
+
+  let now = new Date();
+  lastDayCheckedForDailyStats = now.getDate(); 
+  
+  SaveAllCountersToKVS(); 
+
+  if (log > 0) print("MANUELLER RESET DER TAGESZÄHLER ABGESCHLOSSEN. Werte wurden für Speicherung in KVS-Queue eingereiht.");
+}
+
+
+// ### Haupt-Timer Handler ###
+let counterSaveKVS = 0;
+const SAVE_KVS_INTERVAL_CYCLES = Math.round(30 * 60 / TIMER_INTERVAL_SECONDS); 
+
+// **KORRIGIERTE REIHENFOLGE FÜR MQTT PUBLISH COUNTER**
+const PUBLISH_MQTT_INTERVAL_CYCLES = Math.round(10 / TIMER_INTERVAL_SECONDS); 
+let counterPublishMQTT = PUBLISH_MQTT_INTERVAL_CYCLES -1; // Init so, dass beim ersten Durchlauf nach kurzem Warten publiziert wird.
+
+let lastPublishedMQTTConsumedTotal = "";
+let lastPublishedMQTTReturnedTotal = "";
+let lastPublishedMQTTDailyGridConsumed = "";
+let lastPublishedMQTTSolarSelfConsumption = "";
+let lastPublishedMQTTSolarWasted = "";
+let lastPublishedMQTTGridTotalWatts = "";
+
+let currentGridPower_W = 0; 
+
+function timerHandler(user_data) {
+  let em = Shelly.getComponentStatus("em", 0);
+  if (typeof em === 'undefined' || typeof em.total_act_power === 'undefined') {
+    if (log > 0) print("Fehler: Energiemessdaten (em.total_act_power) nicht verfügbar.");
+    return;
+  }
+
+  currentGridPower_W = em.total_act_power;
+  let solar_W = currentSolarPower; 
+
+  let selfConsumptionInc_Ws = 0;
+  let wastedInc_Ws = 0;
+  let gridConsumedInc_Ws = 0;
+
+  if (currentGridPower_W >= 0) { 
+    energyConsumedWs += currentGridPower_W * TIMER_INTERVAL_SECONDS; 
+    gridConsumedInc_Ws = currentGridPower_W * TIMER_INTERVAL_SECONDS; 
+  } else { 
+    energyReturnedWs -= currentGridPower_W * TIMER_INTERVAL_SECONDS; 
+  }
+  
+  let houseConsumption_W = solar_W + currentGridPower_W; 
+
+  if (solar_W > 0) { 
+      if (currentGridPower_W < 0) { 
+          let netExport_W = -currentGridPower_W;
+          selfConsumptionInc_Ws = (solar_W - netExport_W) * TIMER_INTERVAL_SECONDS;
+          wastedInc_Ws = netExport_W * TIMER_INTERVAL_SECONDS; 
+      } else { 
+          selfConsumptionInc_Ws = Math.min(solar_W, houseConsumption_W) * TIMER_INTERVAL_SECONDS;
+          wastedInc_Ws = 0; 
+      }
+  } else { 
+      selfConsumptionInc_Ws = 0;
+      wastedInc_Ws = 0;
+  }
+  selfConsumptionInc_Ws = Math.max(0, selfConsumptionInc_Ws);
+
+  dailyGridConsumedWs += gridConsumedInc_Ws;
+  dailySolarSelfConsumptionWs += selfConsumptionInc_Ws;
+  dailySolarWastedWs += wastedInc_Ws;
+
+  let fullWhConsumed = Math.floor(energyConsumedWs / 3600);
+  if (fullWhConsumed > 0) {
+    energyConsumedKWh += fullWhConsumed / 1000;
+    energyConsumedWs -= fullWhConsumed * 3600;
+  }
+  let fullWhReturned = Math.floor(energyReturnedWs / 3600);
+  if (fullWhReturned > 0) {
+    energyReturnedKWh += fullWhReturned / 1000;
+    energyReturnedWs -= fullWhReturned * 3600;
+  }
+  let fullWhDailyGrid = Math.floor(dailyGridConsumedWs / 3600);
+  if (fullWhDailyGrid > 0) {
+    dailyGridConsumedKWh += fullWhDailyGrid / 1000;
+    dailyGridConsumedWs -= fullWhDailyGrid * 3600;
+  }
+  let fullWhSolarSelf = Math.floor(dailySolarSelfConsumptionWs / 3600);
+  if (fullWhSolarSelf > 0) {
+    dailySolarSelfConsumptionKWh += fullWhSolarSelf / 1000;
+    dailySolarSelfConsumptionWs -= fullWhSolarSelf * 3600;
+  }
+  let fullWhSolarWasted = Math.floor(dailySolarWastedWs / 3600);
+  if (fullWhSolarWasted > 0) {
+    dailySolarWastedKWh += fullWhSolarWasted / 1000;
+    dailySolarWastedWs -= fullWhSolarWasted * 3600;
+  }
+
+  if (log > 1) {
+    print("Netz:", currentGridPower_W.toFixed(1), "W, Solar:", solar_W.toFixed(1), "W");
+    print("Inc-> TglNetz:", (gridConsumedInc_Ws/TIMER_INTERVAL_SECONDS).toFixed(1),"W, Eigenv.:", (selfConsumptionInc_Ws/TIMER_INTERVAL_SECONDS).toFixed(1), "W, Einspeisung(Wasted):", (wastedInc_Ws/TIMER_INTERVAL_SECONDS).toFixed(1), "W");
+    print("Ws -> TglNetz:", dailyGridConsumedWs.toFixed(0), " Eigenv:", dailySolarSelfConsumptionWs.toFixed(0), " Wasted:", dailySolarWastedWs.toFixed(0));
+    print("kWh-> TglNetz:", dailyGridConsumedKWh.toFixed(3), " Eigenv:", dailySolarSelfConsumptionKWh.toFixed(3), " Wasted:", dailySolarWastedKWh.toFixed(3));
+  }
+
+  counterSaveKVS++;
+  if (counterSaveKVS >= SAVE_KVS_INTERVAL_CYCLES) {
+    counterSaveKVS = 0;
+    SaveAllCountersToKVS();
+  }
+
+  counterPublishMQTT++;
+  if (counterPublishMQTT >= PUBLISH_MQTT_INTERVAL_CYCLES) {
+    counterPublishMQTT = 0;
+
+    if (updateName) {
+      let deviceName = "Akt:" + formatPower(currentGridPower_W) +
+                       " Sol:" + formatPower(currentSolarPower) +
+                       " Tag:" + dailyGridConsumedKWh.toFixed(1) + "kWh" +
+                       " Spar:" + dailySolarSelfConsumptionKWh.toFixed(1) + "kWh";
+
+      if (deviceName.length > 63) { 
+        deviceName = deviceName.substring(0, 63);
+      }
+      Shelly.call(
+        "Sys.SetConfig", { config: { device: { name: deviceName } } },
+        function(result, error_code, error_message) {
+            if (error_code !== 0 && log > 0) {
+                print("Fehler beim Setzen des Gerätenamens ('", deviceName, "', Länge:", deviceName.length, "): ", error_message, " (Code:", error_code,")");
+            }
+        }
+      );
+    }
+
+    if (typeof SHELLY_ID !== "undefined" && MQTTpublish === true) {
+      let valConsumedTotal = energyConsumedKWh.toFixed(3);
+      if (valConsumedTotal !== lastPublishedMQTTConsumedTotal) {
+        MQTT.publish(SHELLY_ID + "/energy_counter/consumed_total_kwh", valConsumedTotal, 0, false);
+        lastPublishedMQTTConsumedTotal = valConsumedTotal;
+      }
+
+      let valReturnedTotal = energyReturnedKWh.toFixed(3);
+      if (valReturnedTotal !== lastPublishedMQTTReturnedTotal) {
+        MQTT.publish(SHELLY_ID + "/energy_counter/returned_total_kwh", valReturnedTotal, 0, false);
+        lastPublishedMQTTReturnedTotal = valReturnedTotal;
+      }
+
+      let valDailyGrid = dailyGridConsumedKWh.toFixed(3);
+      if (valDailyGrid !== lastPublishedMQTTDailyGridConsumed) {
+        MQTT.publish(SHELLY_ID + "/energy_daily/grid_consumed_kwh", valDailyGrid, 0, false);
+        lastPublishedMQTTDailyGridConsumed = valDailyGrid;
+      }
+
+      let valSolarSelf = dailySolarSelfConsumptionKWh.toFixed(3);
+      if (valSolarSelf !== lastPublishedMQTTSolarSelfConsumption) {
+        MQTT.publish(SHELLY_ID + "/energy_daily/solar_self_consumption_kwh", valSolarSelf, 0, false);
+        lastPublishedMQTTSolarSelfConsumption = valSolarSelf;
+      }
+
+      let valSolarWasted = dailySolarWastedKWh.toFixed(3); 
+      if (valSolarWasted !== lastPublishedMQTTSolarWasted) {
+        MQTT.publish(SHELLY_ID + "/energy_daily/solar_to_grid_kwh", valSolarWasted, 0, false); 
+        lastPublishedMQTTSolarWasted = valSolarWasted;
+      }
+
+      let valGridTotalWatts = currentGridPower_W.toFixed(1);
+      if (valGridTotalWatts !== lastPublishedMQTTGridTotalWatts) {
+        MQTT.publish(SHELLY_ID + "/power/grid_total_watts", valGridTotalWatts, 0, false);
+        lastPublishedMQTTGridTotalWatts = valGridTotalWatts;
+      }
+
+      if (log > 1) print("MQTT Daten publiziert.");
     }
   }
+}
+Timer.set(TIMER_INTERVAL_SECONDS * 1000, true, timerHandler, null);
 
-  energyReturnedWs += returnedEnergyInc_Ws;
-  energyConsumedWs += consumedEnergyInc_Ws;
-  energySelfConsumedWs += selfConsumedEnergyInc_Ws;
-  energyWastedWs += wastedEnergyInc_Ws;
-
-  dailyEnergyReturnedKWh += returnedEnergyInc_Ws * WS_TO_KWH_FACTOR;
-  dailyEnergyConsumedKWh += consumedEnergyInc_Ws * WS_TO_KWH_FACTOR;
-  dailyEnergySelfConsumedKWh += selfConsumedEnergyInc_Ws * WS_TO_KWH_FACTOR;
-  dailyEnergyWastedKWh += wastedEnergyInc_Ws * WS_TO_KWH_FACTOR;
-
-  var converted = convertWsToKWhWithRemainder(energyConsumedWs, energyConsumedKWh);
-  energyConsumedWs = converted.ws; energyConsumedKWh = converted.kwh;
-  
-  converted = convertWsToKWhWithRemainder(energyReturnedWs, energyReturnedKWh);
-  energyReturnedWs = converted.ws; energyReturnedKWh = converted.kwh;
-  
-  converted = convertWsToKWhWithRemainder(energySelfConsumedWs, energySelfConsumedKWh);
-  energySelfConsumedWs = converted.ws; energySelfConsumedKWh = converted.kwh;
-  
-  converted = convertWsToKWhWithRemainder(energyWastedWs, energyWastedKWh);
-  energyWastedWs = converted.ws; energyWastedKWh = converted.kwh;
-
-  var currentTime = Date.now();
-
-  // MQTT-Publish alle MQTT_PUBLISH_INTERVAL_MS
-  if (currentTime - lastMQTTPublishTime > MQTT_PUBLISH_INTERVAL_MS) {
-    lastMQTTPublishTime = currentTime;
-    
-    if (MQTTpublish && typeof SHELLY_ID !== "undefined") {
-      MQTT.publish(SHELLY_ID + "/energy/consumed_kwh", energyConsumedKWh.toFixed(3), 0, false);
-      MQTT.publish(SHELLY_ID + "/energy/returned_kwh", energyReturnedKWh.toFixed(3), 0, false);
-      MQTT.publish(SHELLY_ID + "/energy/self_consumed_kwh", energySelfConsumedKWh.toFixed(3), 0, false);
-      MQTT.publish(SHELLY_ID + "/energy/wasted_kwh", energyWastedKWh.toFixed(3), 0, false);
-      
-      MQTT.publish(SHELLY_ID + "/energy/daily/consumed_kwh", dailyEnergyConsumedKWh.toFixed(3), 0, false);
-      MQTT.publish(SHELLY_ID + "/energy/daily/returned_kwh", dailyEnergyReturnedKWh.toFixed(3), 0, false);
-      MQTT.publish(SHELLY_ID + "/energy/daily/self_consumed_kwh", dailyEnergySelfConsumedKWh.toFixed(3), 0, false);
-      MQTT.publish(SHELLY_ID + "/energy/daily/wasted_kwh", dailyEnergyWastedKWh.toFixed(3), 0, false);
-      
-      if (log) print("MQTT-Nachrichten publiziert (Intervall:", MQTT_PUBLISH_INTERVAL_MS / 1000, "s).");
-    }
-  }
-  
-  // KVS-Speicherung alle KVS_SAVE_INTERVAL_MS
-  if (currentTime - lastKVSSaveTime > KVS_SAVE_INTERVAL_MS) {
-    lastKVSSaveTime = currentTime;
-    
-    SafeKVS_Set("EnergyConsumedKWh", energyConsumedKWh.toFixed(3));
-    SafeKVS_Set("EnergyReturnedKWh", energyReturnedKWh.toFixed(3));
-    SafeKVS_Set("EnergySelfConsumedKWh", energySelfConsumedKWh.toFixed(3));
-    SafeKVS_Set("EnergyWastedKWh", energyWastedKWh.toFixed(3));
-    
-    SafeKVS_Set("DailyEnergyConsumedKWh", dailyEnergyConsumedKWh.toFixed(3));
-    SafeKVS_Set("DailyEnergyReturnedKWh", dailyEnergyReturnedKWh.toFixed(3));
-    SafeKVS_Set("DailyEnergySelfConsumedKWh", dailyEnergySelfConsumedKWh.toFixed(3));
-    SafeKVS_Set("DailyEnergyWastedKWh", dailyEnergyWastedKWh.toFixed(3));
-    
-    if (log) print("Energie-Gesamt- und Tageswerte im KVS gespeichert (Intervall:", KVS_SAVE_INTERVAL_MS / 1000, "s).");
-  }
-});
-
-// Initialisierung des Skripts
-if (log) print("Starte Energiezaehler-Skript");
-loadKVS(); // Lade gespeicherte Werte und starte dann die Timer
+if (log > 0) print("Energiezaehler-Skript V1.4.2 gestartet. Mit manueller Reset Funktion und Korrekturen.");
