@@ -29,26 +29,30 @@ Alle erfassten Daten werden persistent im KVS (Flash-Speicher) des Geräts gesic
 
 ## 🚀 Setup & Konfiguration
 
-### 1. Skript installieren
+Dieses Setup besteht aus zwei Skripten. Beide müssen auf Shelly-Geräten in deinem Netzwerk laufen.
 
-1. Öffne die Web-Oberfläche deines Shelly Pro 3EM.
-2. Navigiere zu **Scripts**.
-3. Klicke auf **Add script** und kopiere den gesamten Inhalt der `energy_counter.js` Datei in den Editor.
-4. Speichere das Skript mit **Save**.
+### Schritt 1: Solar-Daten-Skript (`solarWR_Data.js`) einrichten
 
-### 2. Einspeisephase konfigurieren
+Dieses Skript ruft die aktuelle Leistung deiner PV-Anlage von einer OpenDTU ab. Es kann auf demselben Shelly Pro 3EM oder einem anderen Shelly-Gerät im selben Netzwerk laufen.
 
-Öffne das Skript im Editor. Ganz oben findest du die folgende Zeile:
+1. Erstelle ein neues Skript auf dem gewünschten Shelly-Gerät.
+2. Kopiere den gesamten Inhalt der Datei `solarWR_Data.js` aus diesem Repository in den Editor.
+3. **Konfiguriere die URL:** Passe die folgende Zeile mit der IP-Adresse deiner OpenDTU an:
 
-const SOLAR_FEED_IN_PHASE = 2; // 1=Phase A (L1), 2=Phase B (L2), 3=Phase C (L3)
+var OPENDTU_API_URL = "http://192.168.0.170/api/livedata/status";
+4. Speichere und starte das Skript. Aktiviere **Enable**, damit es dauerhaft läuft.
 
+### Schritt 2: Energiezähler-Skript (`energy_counter.js`) einrichten
 
-Passe diesen Wert entsprechend der Phase an, auf der deine PV-Anlage einspeist. Dies ist entscheidend für die korrekte Berechnung des Phasen-Brutto-Verbrauchs.
+Dieses Skript muss auf deinem **Shelly Pro 3EM** laufen. Es liest den von Skript 1 gespeicherten Solar-Wert und führt alle Berechnungen durch.
 
-### 3. Skript starten
+1. Erstelle ein neues Skript auf deinem Shelly Pro 3EM.
+2. Kopiere den gesamten Inhalt der Datei `energy_counter.js` aus diesem Repository in den Editor.
+3. **Konfiguriere die Einspeisephase:** Passe die folgende Zeile an die Phase an, auf der deine PV-Anlage einspeist:
 
-1. Klicke auf den **Play-Button** (▶), um das Skript zu starten.
-2. Aktiviere den Schalter **Enable**, damit das Skript nach einem Neustart des Shelly automatisch gestartet wird.
+const SOLAR_FEED_IN_PHASE = 2;
+4. **Wichtig:** Stelle sicher, dass der KVS-Schlüssel in beiden Skripten identisch ist (`currentSolarPowerWatts`).
+5. Speichere und starte das Skript. Aktiviere **Enable**, damit es dauerhaft läuft.
 
 ---
 
@@ -100,12 +104,12 @@ Falls du die Zählerstände an deinen offiziellen Stromzähler anpassen möchtes
 1. Starte das Skript mindestens einmal, damit die KVS-Schlüssel initialisiert werden.
 2. Öffne die Konsole unterhalb des Skript-Editors.
 3. Gib die folgenden Befehle ein, um die Werte zu setzen (Beispielwerte):
+
+
 // Netzbezug auf 1234.5 kWh setzen
 SetKVS("EnergyConsumedKWh", 1234.5);
-
 // Netzeinspeisung auf 678.9 kWh setzen
 SetKVS("EnergyReturnedKWh", 678.9);
-
 4. **Wichtig:** Stoppe und starte das Skript danach sofort neu, damit die neuen Werte geladen und verwendet werden.
 
 ---
@@ -135,3 +139,4 @@ SetKVS("EnergyReturnedKWh", 678.9);
 - Grundlegende Zählung von Netzbezug (`consumed`) und Einspeisung (`returned`).
 - Persistente Speicherung im KVS.
 - MQTT-Publishing der Basiszähler.
+
